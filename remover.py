@@ -176,9 +176,16 @@ class WatermarkRemover:
     def _template_match_text(self, roi_bgr: np.ndarray, light_on_dark: bool = False) -> Tuple[Optional[Tuple[int, int, int, int]], float]:
         """Template-match the watermark text in the bottom-right ROI.
 
+        Tries both dark-on-light and light-on-dark templates regardless of the
+        ``light_on_dark`` hint, keeping whichever polarity scores higher.  This
+        is the key fix for medium-luminance and translucent backgrounds where
+        the hard luminance threshold mis-classifies the background type, causing
+        the wrong template polarity to be tried and the match to silently fail.
+
         Args:
             roi_bgr: The ROI image in BGR colour space.
-            light_on_dark: If True, match bright text on a dark background.
+            light_on_dark: Hint from the background classifier (no longer the
+                sole authority — both polarities are always searched).
         """
         h, w = roi_bgr.shape[:2]
         if h < 20 or w < 80:
@@ -188,54 +195,68 @@ class WatermarkRemover:
         best_score = 0.0
         best_box = None
 
-        # Histogram-equalise for contrast normalisation.
-        # For light-on-dark we invert first so the template (bright text on dark bg)
-        # produces a positive correlation against the bright watermark pixels.
-        gray_eq = cv2.equalizeHist(255 - gray if light_on_dark else gray)
-
-        for text_h in range(max(14, h // 5), max(18, min(h - 2, h // 2 + 20)), 3):
-            tpl = self._render_text_template(text_h, light_on_dark=light_on_dark)
-            th, tw = tpl.shape[:2]
-            if th >= h or tw >= w:
-                continue
-
-            result = cv2.matchTemplate(gray_eq, tpl, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(result)
-            if max_val > best_score:
-                x, y = max_loc
-                best_score = float(max_val)
-                best_box = (x, y, tw, th)
+        # Try both polarities; equalizeHist preserves relative contrast order
+        # so inverting before equalizing flips which polarity the template expects.
+        for polarity in (False, True):   # False = dark-on-light, True = light-on-dark
+            gray_eq = cv2.equalizeHist(255 - gray if polarity else gray)
+            for text_h in range(max(14, h // 5), max(18, min(h - 2, h // 2 + 20)), 3):
+                tpl = self._render_text_template(text_h, light_on_dark=polarity)
+                th, tw = tpl.shape[:2]
+                if th >= h or tw >= w:
+                    continue
+                result = cv2.matchTemplate(gray_eq, tpl, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, max_loc = cv2.minMaxLoc(result)
+                if max_val > best_score:
+                    x, y = max_loc
+                    best_score = float(max_val)
+                    best_box = (x, y, tw, th)
 
         if best_score < self.config.text_match_threshold:
             return None, best_score
         return best_box, best_score
 
     def _is_dark_background(self, roi_bgr: np.ndarray) -> bool:
-        """Returns True if the ROI has a predominantly dark background."""
+        """Returns True if the ROI has a predominantly dark background.
+
+        Used only for template-matching polarity; candidate extraction no longer
+        relies on this hard threshold.
+        """
         gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
         return float(np.mean(gray)) < self.config.dark_bg_luminance_threshold
 
-    def _extract_dark_candidates(self, roi_bgr: np.ndarray) -> np.ndarray:
+    def _extract_candidates(self, roi_bgr: np.ndarray) -> np.ndarray:
+        """Detect pixels that stand out from their local background regardless of polarity.
+
+        Runs both directions of the contrast diff (darker-than-bg AND
+        lighter-than-bg) and unions the results.  This makes detection work
+        uniformly for:
+          - dark text on light backgrounds
+          - light text on dark backgrounds
+          - any contrast level of text on medium / translucent backgrounds
+
+        The previous approach used a hard per-pixel absolute gate
+        (gray < 210 for dark text, gray > 45 for light text) which silently
+        dropped all pixels in the mid-tone range, causing complete misses on
+        medium-luminance and semi-transparent slides.
+        """
         gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
 
-        # Robust background estimate via median blur
+        # Robust local background estimate via median blur
         ksize = max(15, min(41, ((min(gray.shape[:2]) // 5) | 1)))
         bg = cv2.medianBlur(gray, ksize)
 
-        if self._is_dark_background(roi_bgr):
-            # Dark background: watermark text is LIGHT (bright pixels stand out above the background)
-            diff_light = cv2.subtract(gray, bg)  # positive where pixels are BRIGHTER than bg
-            light_mask = np.where(gray > (255 - self.config.dark_text_threshold), 255, 0).astype(np.uint8)
-            _, diff_mask = cv2.threshold(diff_light, self.config.pixel_threshold, 255, cv2.THRESH_BINARY)
-            mask = cv2.bitwise_and(light_mask, diff_mask)
-        else:
-            # Light background: watermark text is DARK (original behaviour)
-            diff_dark = cv2.subtract(bg, gray)  # positive where pixels are DARKER than bg
-            dark_mask = np.where(gray < self.config.dark_text_threshold, 255, 0).astype(np.uint8)
-            _, diff_mask = cv2.threshold(diff_dark, self.config.pixel_threshold, 255, cv2.THRESH_BINARY)
-            mask = cv2.bitwise_and(dark_mask, diff_mask)
+        # Pixels darker than local background (dark text on any bg)
+        diff_dark  = cv2.subtract(bg, gray)
+        _, dark_diff_mask  = cv2.threshold(diff_dark,  self.config.pixel_threshold, 255, cv2.THRESH_BINARY)
 
-        # Restrict to bottom-right biased region to reduce false positives
+        # Pixels lighter than local background (light text on any bg)
+        diff_light = cv2.subtract(gray, bg)
+        _, light_diff_mask = cv2.threshold(diff_light, self.config.pixel_threshold, 255, cv2.THRESH_BINARY)
+
+        # Union: catch whichever polarity the watermark actually has
+        mask = cv2.bitwise_or(dark_diff_mask, light_diff_mask)
+
+        # Restrict to bottom-right biased region to reduce false positives from slide content
         h, w = gray.shape[:2]
         geom = np.zeros_like(mask)
         x0 = int(w * self.config.roi_right_bias)
@@ -247,6 +268,10 @@ class WatermarkRemover:
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=self.config.close_iterations)
         mask = cv2.dilate(mask, kernel, iterations=self.config.dilate_iterations)
         return mask
+
+    # Keep the old name as an alias so nothing else in the file breaks
+    def _extract_dark_candidates(self, roi_bgr: np.ndarray) -> np.ndarray:
+        return self._extract_candidates(roi_bgr)
 
     def _component_boxes_from_mask(self, mask: np.ndarray) -> List[Tuple[int, int, int, int, int]]:
         n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
@@ -451,63 +476,134 @@ class WatermarkRemover:
         return out
 
     def _patch_reconstruct(self, img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """
-        Heals the masked area by copying a nearby clean patch of background.
-        This is much better for textures like dotted paper or grain.
+        """Remove the masked watermark pixels and reconstruct the background.
+
+        Strategy (in priority order):
+
+        1. **Gradient-aware bilinear interpolation** — samples a thin border of
+           clean pixels around the watermark bounding box and fills the interior
+           via per-channel bilinear interpolation.  Works correctly on solid
+           colours, gradients, and translucent / mid-tone backgrounds because it
+           reads the *actual* surrounding pixel values rather than copying a
+           tile from an assumed-clean offset.
+
+        2. **Horizontal + vertical 1-D interpolation blend** — the original
+           neighbour-scan approach from ``_background_fill_from_neighbors``.
+           Used when the bilinear border doesn't have enough clean samples.
+
+        3. **cv2.INPAINT_TELEA** — last resort if neither interpolation path
+           produces enough data (e.g. watermark touches the image edge).
         """
         h, w = mask.shape[:2]
-        ys, xs = np.where(mask > 0)
-        if len(xs) == 0:
+        if np.count_nonzero(mask) == 0:
             return img_bgr
 
-        # Define the bounding box of the area to heal
         x0, y0, bw, bh = cv2.boundingRect(mask)
-        
-        # Expand slightly
-        pad = 2
-        x0_p = max(0, x0 - pad)
-        y0_p = max(0, y0 - pad)
-        x1_p = min(w, x0 + bw + pad)
-        y1_p = min(h, y0 + bh + pad)
-        
-        bw_p = x1_p - x0_p
-        bh_p = y1_p - y0_p
 
-        # Attempt to find a clean source patch
-        # Try Left first, then Top
-        offsets = [(self.config.patch_offset_x, 0), (0, self.config.patch_offset_y), (self.config.patch_offset_x, self.config.patch_offset_y)]
-        
-        best_patch = None
-        for dx, dy in offsets:
-            src_x = x0_p + dx
-            src_y = y0_p + dy
-            
-            # Check if source is within bounds and doesn't overlap too much with mask
-            if src_x >= 0 and src_y >= 0 and src_x + bw_p <= w and src_y + bh_p <= h:
-                # Check if the source patch itself contains any mask pixels (it should be clean)
-                src_mask = mask[src_y:src_y + bh_p, src_x:src_x + bw_p]
-                if cv2.countNonZero(src_mask) == 0:
-                    best_patch = img_bgr[src_y:src_y + bh_p, src_x:src_x + bw_p].copy()
-                    break
+        # ---------- Strategy 1: bilinear from surrounding border ----------
+        # Sample a ring of clean pixels just outside the watermark bbox.
+        border = max(4, int(min(bw, bh) * 0.15))
+        bx0 = max(0,     x0 - border)
+        by0 = max(0,     y0 - border)
+        bx1 = min(w - 1, x0 + bw + border)
+        by1 = min(h - 1, y0 + bh + border)
+
+        # Build four border strips (top, bottom, left, right) as anchor points
+        # for cv2.remap-based bilinear fill.
+        # Collect clean sample positions and values around the bbox.
+        sample_ys, sample_xs, sample_vals = [], [], []
+        for sx in range(bx0, bx1 + 1):
+            # top strip
+            for sy in range(by0, min(y0, by0 + border)):
+                if mask[sy, sx] == 0:
+                    sample_ys.append(sy); sample_xs.append(sx)
+                    sample_vals.append(img_bgr[sy, sx].astype(np.float32))
+            # bottom strip
+            for sy in range(max(y0 + bh, by1 - border), by1 + 1):
+                if 0 <= sy < h and mask[sy, sx] == 0:
+                    sample_ys.append(sy); sample_xs.append(sx)
+                    sample_vals.append(img_bgr[sy, sx].astype(np.float32))
+        for sy in range(by0, by1 + 1):
+            # left strip
+            for sx in range(bx0, min(x0, bx0 + border)):
+                if mask[sy, sx] == 0:
+                    sample_ys.append(sy); sample_xs.append(sx)
+                    sample_vals.append(img_bgr[sy, sx].astype(np.float32))
+            # right strip
+            for sx in range(max(x0 + bw, bx1 - border), bx1 + 1):
+                if 0 <= sx < w and mask[sy, sx] == 0:
+                    sample_ys.append(sy); sample_xs.append(sx)
+                    sample_vals.append(img_bgr[sy, sx].astype(np.float32))
 
         out = img_bgr.copy()
-        if best_patch is not None:
-            # We have a clean tile. We only paste the pixels where the mask is active
-            # to preserve as much original detail as possible.
-            target_roi = out[y0_p:y1_p, x0_p:x1_p]
-            mask_roi = mask[y0_p:y1_p, x0_p:x1_p]
-            
-            # Simple alpha blending on the edges of the mask to smooth transition
-            mask_float = mask_roi.astype(float) / 255.0
-            mask_float = cv2.GaussianBlur(mask_float, (3, 3), 0)
-            
-            for c in range(3):
-                target_roi[:, :, c] = (target_roi[:, :, c] * (1 - mask_float) + 
-                                       best_patch[:, :, c] * mask_float).astype(np.uint8)
-        else:
-            # Fallback to inpainting if no clean patch found
-            out = cv2.inpaint(out, mask, self.config.inpaint_radius, cv2.INPAINT_TELEA)
+        mask_ys, mask_xs = np.where(mask > 0)
 
+        if len(sample_ys) >= 4:
+            sy_arr = np.array(sample_ys, dtype=np.float32)
+            sx_arr = np.array(sample_xs, dtype=np.float32)
+            sv_arr = np.array(sample_vals, dtype=np.float32)   # shape (N, 3)
+
+            # For each masked pixel, do inverse-distance weighted average of
+            # all border samples — cheap, exact on smooth gradients.
+            for py, px in zip(mask_ys, mask_xs):
+                dy = sy_arr - py
+                dx = sx_arr - px
+                dist2 = dy * dy + dx * dx
+                # Guard against zero distance (shouldn't happen but safety first)
+                dist2 = np.where(dist2 < 1e-6, 1e-6, dist2)
+                weights = 1.0 / dist2
+                total_w = weights.sum()
+                for c in range(3):
+                    out[py, px, c] = np.clip(
+                        np.dot(weights, sv_arr[:, c]) / total_w, 0, 255
+                    ).astype(np.uint8)
+
+            # Feather edges with a tiny Gaussian on the mask boundary
+            mask_f = mask.astype(np.float32) / 255.0
+            mask_f = cv2.GaussianBlur(mask_f, (3, 3), 0)
+            for c in range(3):
+                orig_c = img_bgr[:, :, c].astype(np.float32)
+                fill_c = out[:, :, c].astype(np.float32)
+                out[:, :, c] = np.clip(orig_c * (1.0 - mask_f) + fill_c * mask_f, 0, 255).astype(np.uint8)
+            return out
+
+        # ---------- Strategy 2: 1-D h/v interpolation (original logic) ----------
+        expand = self.config.bg_fill_expand
+        rx0 = max(0, x0 - expand);  ry0 = max(0, y0 - expand)
+        rx1 = min(w - 1, x0 + bw + expand); ry1 = min(h - 1, y0 + bh + expand)
+
+        patch  = out[ry0:ry1 + 1, rx0:rx1 + 1].copy()
+        pmask  = mask[ry0:ry1 + 1, rx0:rx1 + 1]
+        ph, pw = pmask.shape[:2]
+
+        horiz = patch.copy().astype(np.float32)
+        for yy in range(ph):
+            row_mask = pmask[yy] > 0
+            if not np.any(row_mask):
+                continue
+            known = np.where(~row_mask)[0]
+            if len(known) < 2:
+                continue
+            for c in range(3):
+                horiz[yy, np.where(row_mask)[0], c] = np.interp(
+                    np.where(row_mask)[0], known, patch[yy, known, c].astype(np.float32))
+
+        vert = patch.copy().astype(np.float32)
+        for xx in range(pw):
+            col_mask = pmask[:, xx] > 0
+            if not np.any(col_mask):
+                continue
+            known = np.where(~col_mask)[0]
+            if len(known) < 2:
+                continue
+            for c in range(3):
+                vert[np.where(col_mask)[0], xx, c] = np.interp(
+                    np.where(col_mask)[0], known, patch[known, xx, c].astype(np.float32))
+
+        blend = patch.copy().astype(np.float32)
+        m = pmask > 0
+        blend[m] = 0.5 * horiz[m] + 0.5 * vert[m]
+        out[ry0:ry1 + 1, rx0:rx1 + 1] = np.clip(blend, 0, 255).astype(np.uint8)
         return out
 
     def _clean_watermark_in_roi(self, roi_bgr: np.ndarray) -> Optional[np.ndarray]:
