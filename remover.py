@@ -65,6 +65,12 @@ class WatermarkConfig:
     patch_offset_x: int = -80  # Look 80px to the left for clean background
     patch_offset_y: int = -80  # Or 80px above
 
+    # Background fill expansion (pixels around mask bbox to include in neighbor interpolation)
+    bg_fill_expand: int = 4
+
+    # Dark background detection: if average luminance of ROI is below this, treat as dark bg
+    dark_bg_luminance_threshold: int = 128
+
     # Debug
     debug: bool = False
 
@@ -104,17 +110,27 @@ class WatermarkRemover:
             return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         return None
 
-    def _render_text_template(self, height: int) -> np.ndarray:
-        """Creates a binary template for 'NotebookLM' at a target height."""
-        key = max(10, int(height))
+    def _render_text_template(self, height: int, light_on_dark: bool = False) -> np.ndarray:
+        """Creates a binary template for 'NotebookLM' at a target height.
+
+        Args:
+            height: Target text height in pixels.
+            light_on_dark: If True, returns a light-on-dark template (for dark backgrounds).
+                           If False (default), returns a dark-on-light template.
+        """
+        key = (max(10, int(height)), light_on_dark)
         if key in self._template_cache:
             return self._template_cache[key]
 
-        font_size = max(12, int(key * 1.15))
+        font_size = max(12, int(max(10, int(height)) * 1.15))
         canvas_w = max(180, font_size * 14)
         canvas_h = max(40, font_size * 3)
 
-        img = Image.new('L', (canvas_w, canvas_h), 255)
+        # Background and foreground colours depend on polarity
+        bg_fill = 0 if light_on_dark else 255
+        text_fill = 255 if light_on_dark else 0
+
+        img = Image.new('L', (canvas_w, canvas_h), bg_fill)
         draw = ImageDraw.Draw(img)
 
         font = None
@@ -138,10 +154,16 @@ class WatermarkRemover:
         th = bbox[3] - bbox[1]
         x = 8
         y = max(4, (canvas_h - th) // 2 - bbox[1])
-        draw.text((x, y), self.WATERMARK_TEXT, fill=0, font=font)
+        draw.text((x, y), self.WATERMARK_TEXT, fill=text_fill, font=font)
 
         arr = np.array(img)
-        _, binary = cv2.threshold(arr, 200, 255, cv2.THRESH_BINARY_INV)
+        # For light-on-dark: foreground pixels are bright (> 200)
+        # For dark-on-light: foreground pixels are dark (< 55) -> BINARY_INV threshold at 200
+        if light_on_dark:
+            _, binary = cv2.threshold(arr, 200, 255, cv2.THRESH_BINARY)
+        else:
+            _, binary = cv2.threshold(arr, 200, 255, cv2.THRESH_BINARY_INV)
+
         ys, xs = np.where(binary > 0)
         if len(xs) == 0 or len(ys) == 0:
             tpl = np.zeros((10, 80), dtype=np.uint8)
@@ -151,8 +173,13 @@ class WatermarkRemover:
         self._template_cache[key] = tpl
         return tpl
 
-    def _template_match_text(self, roi_bgr: np.ndarray) -> Tuple[Optional[Tuple[int, int, int, int]], float]:
-        """Template-match the watermark text in the bottom-right ROI."""
+    def _template_match_text(self, roi_bgr: np.ndarray, light_on_dark: bool = False) -> Tuple[Optional[Tuple[int, int, int, int]], float]:
+        """Template-match the watermark text in the bottom-right ROI.
+
+        Args:
+            roi_bgr: The ROI image in BGR colour space.
+            light_on_dark: If True, match bright text on a dark background.
+        """
         h, w = roi_bgr.shape[:2]
         if h < 20 or w < 80:
             return None, 0.0
@@ -161,11 +188,13 @@ class WatermarkRemover:
         best_score = 0.0
         best_box = None
 
-        # Restrict to dark-on-light candidates
-        gray_eq = cv2.equalizeHist(gray)
+        # Histogram-equalise for contrast normalisation.
+        # For light-on-dark we invert first so the template (bright text on dark bg)
+        # produces a positive correlation against the bright watermark pixels.
+        gray_eq = cv2.equalizeHist(255 - gray if light_on_dark else gray)
 
         for text_h in range(max(14, h // 5), max(18, min(h - 2, h // 2 + 20)), 3):
-            tpl = self._render_text_template(text_h)
+            tpl = self._render_text_template(text_h, light_on_dark=light_on_dark)
             th, tw = tpl.shape[:2]
             if th >= h or tw >= w:
                 continue
@@ -181,19 +210,30 @@ class WatermarkRemover:
             return None, best_score
         return best_box, best_score
 
+    def _is_dark_background(self, roi_bgr: np.ndarray) -> bool:
+        """Returns True if the ROI has a predominantly dark background."""
+        gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+        return float(np.mean(gray)) < self.config.dark_bg_luminance_threshold
+
     def _extract_dark_candidates(self, roi_bgr: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
 
-        # Robust background estimate
+        # Robust background estimate via median blur
         ksize = max(15, min(41, ((min(gray.shape[:2]) // 5) | 1)))
         bg = cv2.medianBlur(gray, ksize)
-        diff_dark = cv2.subtract(bg, gray)
 
-        # Dark pixels on light background
-        dark_mask = np.where(gray < self.config.dark_text_threshold, 255, 0).astype(np.uint8)
-        _, diff_mask = cv2.threshold(diff_dark, self.config.pixel_threshold, 255, cv2.THRESH_BINARY)
-
-        mask = cv2.bitwise_and(dark_mask, diff_mask)
+        if self._is_dark_background(roi_bgr):
+            # Dark background: watermark text is LIGHT (bright pixels stand out above the background)
+            diff_light = cv2.subtract(gray, bg)  # positive where pixels are BRIGHTER than bg
+            light_mask = np.where(gray > (255 - self.config.dark_text_threshold), 255, 0).astype(np.uint8)
+            _, diff_mask = cv2.threshold(diff_light, self.config.pixel_threshold, 255, cv2.THRESH_BINARY)
+            mask = cv2.bitwise_and(light_mask, diff_mask)
+        else:
+            # Light background: watermark text is DARK (original behaviour)
+            diff_dark = cv2.subtract(bg, gray)  # positive where pixels are DARKER than bg
+            dark_mask = np.where(gray < self.config.dark_text_threshold, 255, 0).astype(np.uint8)
+            _, diff_mask = cv2.threshold(diff_dark, self.config.pixel_threshold, 255, cv2.THRESH_BINARY)
+            mask = cv2.bitwise_and(dark_mask, diff_mask)
 
         # Restrict to bottom-right biased region to reduce false positives
         h, w = gray.shape[:2]
@@ -249,8 +289,8 @@ class WatermarkRemover:
     def _build_watermark_mask(self, roi_bgr: np.ndarray) -> Optional[np.ndarray]:
         """
         Hybrid watermark detection:
-        1) detect dark components in the bottom-right region,
-        2) locate text using template matching,
+        1) detect dark/light components (polarity auto-detected) in the bottom-right region,
+        2) locate text using template matching (correct polarity),
         3) fuse text-like components and optional icon,
         4) return a tight but safe mask for removal.
         """
@@ -258,12 +298,14 @@ class WatermarkRemover:
         if h < 10 or w < 20:
             return None
 
+        light_on_dark = self._is_dark_background(roi_bgr)
+
         candidate_mask = self._extract_dark_candidates(roi_bgr)
         comps = self._component_boxes_from_mask(candidate_mask)
         if not comps:
             return None
 
-        text_box, score = self._template_match_text(roi_bgr)
+        text_box, score = self._template_match_text(roi_bgr, light_on_dark=light_on_dark)
         if text_box is None:
             # fallback: try union of bottom-right compact components
             selected = []
@@ -328,7 +370,7 @@ class WatermarkRemover:
                 if x == ix and y == iy and cw == iw and ch == ih:
                     selected_mask[labels == i] = 255
 
-        # If template says text exists but selected mask is too thin, force text band from dark pixels
+        # If template says text exists but selected mask is too thin, force text band from candidate pixels
         text_band = candidate_mask[max(0, ty - 3):min(h, ty + th + 3), max(0, tx - 4):min(w, tx + tw + 4)]
         if cv2.countNonZero(selected_mask) < self.config.min_watermark_area and cv2.countNonZero(text_band) > 40:
             selected_mask[max(0, ty - 3):min(h, ty + th + 3), max(0, tx - 4):min(w, tx + tw + 4)] = text_band
